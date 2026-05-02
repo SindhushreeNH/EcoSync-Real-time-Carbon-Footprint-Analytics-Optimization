@@ -1,13 +1,17 @@
-"""Carbon emission forecasting models."""
+"""Carbon emission forecasting models (Streamlit Cloud safe version)."""
 
+import os
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 
+# Prevent Prophet Stan backend crash on Streamlit Cloud
+os.environ["CMDSTAN"] = ""
+
 try:
     from prophet import Prophet
     PROPHET_AVAILABLE = True
-except ImportError:
+except Exception:
     PROPHET_AVAILABLE = False
 
 
@@ -18,6 +22,8 @@ class CarbonForecastModel:
         self.model_type = model_type
         self.model = None
         self.is_fitted = False
+        self._last_data = None
+        self.use_prophet = PROPHET_AVAILABLE
 
     def prepare_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Prepare data for Prophet model."""
@@ -27,21 +33,30 @@ class CarbonForecastModel:
         return prophet_df
 
     def fit(self, df: pd.DataFrame):
-        """Fit the forecasting model."""
-        if not PROPHET_AVAILABLE:
-            self.is_fitted = True
-            self._last_data = df.copy()
-            return
+        """Fit forecasting model with automatic fallback."""
+        self._last_data = df.copy()
 
-        prophet_df = self.prepare_data(df)
+        # Try Prophet first
+        if self.use_prophet:
+            try:
+                prophet_df = self.prepare_data(df)
 
-        self.model = Prophet(
-            daily_seasonality=True,
-            weekly_seasonality=True,
-            yearly_seasonality=False,
-            changepoint_prior_scale=0.05,
-        )
-        self.model.fit(prophet_df)
+                self.model = Prophet(
+                    daily_seasonality=True,
+                    weekly_seasonality=True,
+                    yearly_seasonality=False,
+                    changepoint_prior_scale=0.05,
+                )
+
+                self.model.fit(prophet_df)
+                self.is_fitted = True
+                return
+
+            except Exception as e:
+                print("Prophet backend failed, switching to fallback model:", e)
+                self.use_prophet = False
+
+        # Fallback model (no Prophet)
         self.is_fitted = True
 
     def predict(self, hours_ahead: int = 24) -> pd.DataFrame:
@@ -49,46 +64,57 @@ class CarbonForecastModel:
         if not self.is_fitted:
             raise ValueError("Model must be fitted before prediction")
 
-        if not PROPHET_AVAILABLE:
-            return self._simple_forecast(hours_ahead)
+        # Use Prophet if available
+        if self.use_prophet and self.model is not None:
+            try:
+                future = self.model.make_future_dataframe(
+                    periods=hours_ahead,
+                    freq="h"
+                )
 
-        future = self.model.make_future_dataframe(periods=hours_ahead, freq="h")
-        forecast = self.model.predict(future)
+                forecast = self.model.predict(future)
 
-        result = forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].tail(hours_ahead)
-        result.columns = [
-            "timestamp",
-            "carbon_intensity",
-            "carbon_lower",
-            "carbon_upper",
-        ]
+                result = forecast[
+                    ["ds", "yhat", "yhat_lower", "yhat_upper"]
+                ].tail(hours_ahead)
 
-        # Clip to realistic values
-        result["carbon_intensity"] = result["carbon_intensity"].clip(0.05, 0.8)
-        result["carbon_lower"] = result["carbon_lower"].clip(0.05, 0.8)
-        result["carbon_upper"] = result["carbon_upper"].clip(0.05, 0.8)
+                result.columns = [
+                    "timestamp",
+                    "carbon_intensity",
+                    "carbon_lower",
+                    "carbon_upper",
+                ]
 
-        return result
+                return self._clip_values(result)
+
+            except Exception as e:
+                print("Prediction failed, using fallback:", e)
+
+        # fallback prediction
+        return self._simple_forecast(hours_ahead)
 
     def _simple_forecast(self, hours_ahead: int) -> pd.DataFrame:
         """Simple fallback forecast without Prophet."""
         last_time = self._last_data["timestamp"].max()
+
         future_times = pd.date_range(
-            start=last_time + timedelta(hours=1), periods=hours_ahead, freq="h"
+            start=last_time + timedelta(hours=1),
+            periods=hours_ahead,
+            freq="h",
         )
 
-        # Use historical patterns
         hour_means = self._last_data.groupby(
             self._last_data["timestamp"].dt.hour
         )["carbon_intensity"].mean()
 
         predictions = []
+
         for t in future_times:
             base = hour_means.get(t.hour, 0.35)
             noise = np.random.normal(0, 0.02)
             predictions.append(np.clip(base + noise, 0.05, 0.8))
 
-        return pd.DataFrame(
+        result = pd.DataFrame(
             {
                 "timestamp": future_times,
                 "carbon_intensity": predictions,
@@ -96,6 +122,15 @@ class CarbonForecastModel:
                 "carbon_upper": [p + 0.05 for p in predictions],
             }
         )
+
+        return self._clip_values(result)
+
+    def _clip_values(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Ensure forecast values remain realistic."""
+        df["carbon_intensity"] = df["carbon_intensity"].clip(0.05, 0.8)
+        df["carbon_lower"] = df["carbon_lower"].clip(0.05, 0.8)
+        df["carbon_upper"] = df["carbon_upper"].clip(0.05, 0.8)
+        return df
 
 
 class EmissionPredictor:
@@ -114,7 +149,7 @@ class EmissionPredictor:
         carbon_forecast: pd.DataFrame,
     ) -> dict:
         """Predict emissions for a scheduled task."""
-        # Find carbon intensity at scheduled time
+
         forecast_at_time = carbon_forecast[
             carbon_forecast["timestamp"] >= scheduled_time
         ].head(int(np.ceil(duration_hours)))
@@ -124,15 +159,18 @@ class EmissionPredictor:
         else:
             avg_intensity = forecast_at_time["carbon_intensity"].mean()
 
-        # Calculate energy consumption
         emissions = self.calculator.calculate_total_emissions(
-            cpu_percent, ram_gb, duration_hours
+            cpu_percent,
+            ram_gb,
+            duration_hours,
         )
 
-        # Adjust for forecasted carbon intensity
         self.calculator.emission_factor = avg_intensity
+
         adjusted_emissions = self.calculator.calculate_total_emissions(
-            cpu_percent, ram_gb, duration_hours
+            cpu_percent,
+            ram_gb,
+            duration_hours,
         )
 
         return {
@@ -141,5 +179,9 @@ class EmissionPredictor:
             "forecasted_carbon_intensity": round(avg_intensity, 3),
             "predicted_kwh": adjusted_emissions["total_kwh"],
             "predicted_carbon_kg": adjusted_emissions["total_carbon_kg"],
-            "confidence": "high" if len(forecast_at_time) >= duration_hours else "medium",
+            "confidence": (
+                "high"
+                if len(forecast_at_time) >= duration_hours
+                else "medium"
+            ),
         }
