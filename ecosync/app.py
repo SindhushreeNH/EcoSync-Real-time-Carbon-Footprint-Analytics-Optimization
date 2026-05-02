@@ -47,10 +47,7 @@ def main():
 
     # Sidebar
     with st.sidebar:
-        st.image(
-            "[img.icons8.com](https://img.icons8.com/fluency/96/earth-planet.png)",
-            width=80,
-        )
+        st.image("https://img.icons8.com/fluency/96/earth-planet.png", width=80)
         st.title("EcoSync")
         st.markdown("*Carbon Footprint Analytics*")
 
