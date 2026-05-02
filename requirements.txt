@@ -1,1 +1,8 @@
-streamlit==1.31.0pandas==2.2.0numpy==1.26.3plotly==5.18.0prophet==1.1.5scikit-learn==1.4.0psutil==5.9.8requests==2.31.0python-dotenv==1.0.1
+streamlit==1.31.0
+pandas==2.2.0
+numpy==1.26.3
+plotly==5.18.0
+prophet==1.1.5
+holidays==0.41
+scikit-learn==1.4.0
+psutil==5.9.8
